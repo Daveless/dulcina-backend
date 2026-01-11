@@ -5,6 +5,11 @@ namespace App\Services;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
+/**
+ * Servicio para leer productos desde Meta Catalog
+ * Los productos en Meta provienen de WooCommerce (sincronización automática)
+ * Este servicio SOLO lee, no crea/edita/elimina
+ */
 class MetaCatalogService
 {
     private string $baseUrl;
@@ -43,7 +48,7 @@ class MetaCatalogService
     {
         return [
             'meta_product_id' => $metaProduct['id'],
-            'retailer_id' => $metaProduct['retailer_id'] ?? null,
+            'retailer_id' => $metaProduct['retailer_id'] ?? null, // ID de WooCommerce
             'name' => $metaProduct['name'] ?? 'Sin nombre',
             'description' => $metaProduct['description'] ?? null,
             'price' => $this->parsePrice($metaProduct['price'] ?? 0),
@@ -54,16 +59,15 @@ class MetaCatalogService
     }
 
     /**
-     * OBTENER productos con todos sus campos
+     * Obtener productos con paginación
      */
-    public function getProducts(int $limit = 25): array
+    public function getProducts(int $limit = 100): array
     {
         try {
             $url = $this->buildUrl("{$this->catalogId}/products");
 
             $response = Http::get($url, [
                 'access_token' => $this->accessToken,
-                // Incluir retailer_id para identificar productos de WooCommerce
                 'fields' => 'id,retailer_id,name,description,price,availability,image_url,url',
                 'limit' => $limit,
             ]);
@@ -100,7 +104,7 @@ class MetaCatalogService
     }
 
     /**
-     * OBTENER TODOS los productos con paginación automática
+     * Obtener TODOS los productos (paginación automática)
      */
     public function getAllProducts(): array
     {
@@ -140,7 +144,7 @@ class MetaCatalogService
     }
 
     /**
-     * OBTENER un producto específico
+     * Obtener un producto específico
      */
     public function getProduct(string $productId): ?array
     {
@@ -172,230 +176,6 @@ class MetaCatalogService
 
             return null;
         }
-    }
-
-    /**
-     * FORZAR sincronización del catálogo desde WooCommerce
-     * Esto le dice a Meta que actualice los productos desde la fuente de WooCommerce
-     */
-    public function triggerWooCommerceSync(): array
-    {
-        try {
-            $url = $this->buildUrl("{$this->catalogId}/product_feeds");
-
-            // Primero obtener el feed de WooCommerce
-            $response = Http::get($url, [
-                'access_token' => $this->accessToken,
-            ]);
-
-            if ($response->failed()) {
-                throw new \Exception('No se pudo obtener la lista de feeds');
-            }
-
-            $feeds = $response->json()['data'] ?? [];
-
-            // Buscar el feed de WooCommerce
-            $wooFeed = collect($feeds)->first(function($feed) {
-                return isset($feed['name']) &&
-                       (str_contains(strtolower($feed['name']), 'woo') ||
-                        str_contains(strtolower($feed['name']), 'test store'));
-            });
-
-            if (!$wooFeed) {
-                throw new \Exception('No se encontró el feed de WooCommerce');
-            }
-
-            // Forzar actualización del feed
-            $feedId = $wooFeed['id'];
-            $updateUrl = $this->buildUrl("{$feedId}");
-
-            $updateResponse = Http::post($updateUrl, [
-                'access_token' => $this->accessToken,
-                'update_only' => false, // Esto fuerza una sincronización completa
-            ]);
-
-            if ($updateResponse->failed()) {
-                Log::error('Failed to trigger sync', [
-                    'feed_id' => $feedId,
-                    'response' => $updateResponse->json(),
-                ]);
-
-                throw new \Exception('No se pudo iniciar la sincronización');
-            }
-
-            Log::info('WooCommerce sync triggered', [
-                'feed_id' => $feedId,
-                'feed_name' => $wooFeed['name'],
-            ]);
-
-            return [
-                'success' => true,
-                'feed_id' => $feedId,
-                'feed_name' => $wooFeed['name'],
-                'message' => 'Sincronización iniciada. Los productos se actualizarán en breve.',
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('Error triggering WooCommerce sync', [
-                'error' => $e->getMessage(),
-            ]);
-
-            return [
-                'success' => false,
-                'error' => $e->getMessage(),
-            ];
-        }
-    }
-
-    /**
-     * ELIMINAR productos creados directamente (no de WooCommerce)
-     * Útil para limpiar productos duplicados
-     */
-    public function deleteNonWooCommerceProducts(): array
-    {
-        try {
-            $allProducts = $this->getAllProducts();
-            $deleted = [];
-            $errors = [];
-
-            foreach ($allProducts as $product) {
-                // Identificar productos NO de WooCommerce
-                // Los de WooCommerce tienen retailer_id numérico simple (ej: "1804")
-                // Los creados por tu código tienen formato "product_timestamp_random"
-
-                $retailerId = $product['retailer_id'] ?? '';
-
-                if (str_starts_with($retailerId, 'product_')) {
-                    // Este es un producto creado por tu código, eliminarlo
-                    try {
-                        $success = $this->batchDeleteProduct($product['meta_product_id'], $retailerId);
-
-                        if ($success) {
-                            $deleted[] = [
-                                'id' => $product['meta_product_id'],
-                                'name' => $product['name'],
-                                'retailer_id' => $retailerId,
-                            ];
-                        }
-                    } catch (\Exception $e) {
-                        $errors[] = [
-                            'id' => $product['meta_product_id'],
-                            'error' => $e->getMessage(),
-                        ];
-                    }
-                }
-            }
-
-            return [
-                'deleted_count' => count($deleted),
-                'error_count' => count($errors),
-                'deleted' => $deleted,
-                'errors' => $errors,
-            ];
-
-        } catch (\Exception $e) {
-            Log::error('Error cleaning non-WooCommerce products', [
-                'error' => $e->getMessage(),
-            ]);
-
-            return [
-                'deleted_count' => 0,
-                'error_count' => 1,
-                'errors' => [$e->getMessage()],
-            ];
-        }
-    }
-
-    /**
-     * Batch API para eliminar un producto
-     */
-    private function batchDeleteProduct(string $metaProductId, string $retailerId): bool
-    {
-        try {
-            $url = $this->buildUrl("{$this->catalogId}/items_batch");
-
-            $response = Http::asForm()->post($url, [
-                'access_token' => $this->accessToken,
-                'requests' => json_encode([
-                    [
-                        'method' => 'DELETE',
-                        'retailer_id' => $retailerId,
-                    ]
-                ]),
-            ]);
-
-            if ($response->failed()) {
-                Log::error('Batch delete failed', [
-                    'product_id' => $metaProductId,
-                    'retailer_id' => $retailerId,
-                    'response' => $response->json(),
-                ]);
-                return false;
-            }
-
-            $result = $response->json();
-            $handle = $result['handles'][0] ?? null;
-
-            if (!$handle) {
-                return false;
-            }
-
-            // Esperar un momento y verificar el status
-            sleep(2);
-
-            $statusUrl = $this->buildUrl("{$this->catalogId}/check_batch_request_status");
-            $statusResponse = Http::get($statusUrl, [
-                'access_token' => $this->accessToken,
-                'handle' => $handle,
-            ]);
-
-            $status = $statusResponse->json();
-
-            Log::info('Batch delete status', [
-                'handle' => $handle,
-                'status' => $status,
-            ]);
-
-            return true;
-
-        } catch (\Exception $e) {
-            Log::error('Error in batchDeleteProduct', [
-                'error' => $e->getMessage(),
-            ]);
-            return false;
-        }
-    }
-
-    /**
-     * NO USAR - Mantener solo para compatibilidad
-     * Los productos deben crearse desde WooCommerce
-     */
-    public function createProduct(array $productData): ?array
-    {
-        Log::warning('createProduct called - Products should be created in WooCommerce instead');
-
-        throw new \Exception(
-            'No se pueden crear productos directamente en Meta. ' .
-            'Por favor, crea los productos en WooCommerce y sincroniza el catálogo.'
-        );
-    }
-
-    /**
-     * NO USAR - La actualización se hace desde WooCommerce
-     */
-    public function updateProduct(string $metaProductId, array $productData): bool
-    {
-        Log::warning('updateProduct called - Products should be updated in WooCommerce instead');
-        return true;
-    }
-
-    /**
-     * NO USAR - La eliminación se hace desde WooCommerce
-     */
-    public function deleteProduct(string $metaProductId): bool
-    {
-        Log::warning('deleteProduct called - Products should be deleted in WooCommerce instead');
-        return true;
     }
 
     /**
@@ -445,7 +225,7 @@ class MetaCatalogService
     }
 
     /**
-     * Obtener los feeds configurados (incluyendo WooCommerce)
+     * Obtener los feeds del catálogo (WooCommerce, etc.)
      */
     public function getProductFeeds(): array
     {
@@ -454,7 +234,7 @@ class MetaCatalogService
 
             $response = Http::get($url, [
                 'access_token' => $this->accessToken,
-                'fields' => 'id,name,latest_upload',
+                'fields' => 'id,name,latest_upload,schedule',
             ]);
 
             if ($response->failed()) {
@@ -469,6 +249,167 @@ class MetaCatalogService
             ]);
 
             return [];
+        }
+    }
+
+    /**
+     * Forzar actualización de un feed específico
+     */
+    public function triggerFeedUpdate(string $feedId): bool
+    {
+        try {
+            $url = $this->buildUrl("{$feedId}/uploads");
+
+            $response = Http::post($url, [
+                'access_token' => $this->accessToken,
+            ]);
+
+            if ($response->successful()) {
+                Log::info('Feed update triggered', [
+                    'feed_id' => $feedId,
+                    'response' => $response->json(),
+                ]);
+                return true;
+            }
+
+            return false;
+
+        } catch (\Exception $e) {
+            Log::error('Error triggering feed update', [
+                'feed_id' => $feedId,
+                'error' => $e->getMessage(),
+            ]);
+            return false;
+        }
+    }
+
+    /**
+    * Verificar si WooCommerce está correctamente sincronizado con Meta
+    */
+    public function checkWooCommerceSyncStatus(): array
+    {
+        try {
+            // 1. Verificar conexión al catálogo
+            if (!$this->testConnection()) {
+                return [
+                    'configured' => false,
+                    'error' => 'No se puede conectar con el catálogo de Meta',
+                ];
+            }
+
+            // 2. Obtener feeds configurados
+            $feeds = $this->getProductFeeds();
+
+            if (empty($feeds)) {
+                return [
+                    'configured' => false,
+                    'error' => 'No hay feeds configurados en el catálogo',
+                ];
+            }
+
+            // 3. Buscar feed de WooCommerce
+            $wooFeed = collect($feeds)->first(function ($feed) {
+                $name = strtolower($feed['name'] ?? '');
+                return str_contains($name, 'woo')
+                    || str_contains($name, 'wordpress')
+                    || str_contains($name, 'test store');
+            });
+
+            if (!$wooFeed) {
+                return [
+                    'configured' => false,
+                    'error' => 'No se encontró un feed de WooCommerce',
+                    'available_feeds' => $feeds,
+                ];
+            }
+
+            return [
+                'configured' => true,
+                'feed' => [
+                    'id' => $wooFeed['id'],
+                    'name' => $wooFeed['name'],
+                    'latest_upload' => $wooFeed['latest_upload'] ?? null,
+                    'schedule' => $wooFeed['schedule'] ?? null,
+                ],
+                'message' => 'WooCommerce está correctamente vinculado a Meta',
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('Error checking WooCommerce sync status', [
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'configured' => false,
+                'error' => $e->getMessage(),
+            ];
+        }
+    }
+
+
+    /**
+     * Forzar sincronización con WooCommerce
+     * Busca el feed de WooCommerce y lo actualiza
+     */
+    public function syncWithWooCommerce(): array
+    {
+        try {
+            $feeds = $this->getProductFeeds();
+
+            if (empty($feeds)) {
+                return [
+                    'success' => false,
+                    'error' => 'No se encontraron feeds configurados',
+                    'solution' => 'Configura la integración WooCommerce → Meta en Commerce Manager',
+                ];
+            }
+
+            // Buscar el feed de WooCommerce
+            $wooFeed = collect($feeds)->first(function($feed) {
+                $name = strtolower($feed['name'] ?? '');
+                return str_contains($name, 'woo') ||
+                       str_contains($name, 'test store') ||
+                       str_contains($name, 'wordpress');
+            });
+
+            if (!$wooFeed) {
+                return [
+                    'success' => false,
+                    'error' => 'No se encontró el feed de WooCommerce',
+                    'available_feeds' => array_map(fn($f) => [
+                        'id' => $f['id'],
+                        'name' => $f['name'] ?? 'Sin nombre',
+                    ], $feeds),
+                ];
+            }
+
+            // Forzar actualización
+            $success = $this->triggerFeedUpdate($wooFeed['id']);
+
+            if ($success) {
+                return [
+                    'success' => true,
+                    'feed_id' => $wooFeed['id'],
+                    'feed_name' => $wooFeed['name'],
+                    'message' => 'Sincronización iniciada. Espera 2-5 minutos.',
+                    'next_step' => 'Ejecuta POST /api/products/sync-all para traer productos a tu BD',
+                ];
+            }
+
+            return [
+                'success' => false,
+                'error' => 'No se pudo iniciar la sincronización',
+            ];
+
+        } catch (\Exception $e) {
+            Log::error('Error syncing with WooCommerce', [
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $e->getMessage(),
+            ];
         }
     }
 }
